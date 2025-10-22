@@ -1,0 +1,164 @@
+---
+- name: Ensure APT cache is up to date
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install required packages
+  apt:
+    name:
+      - zsh
+      - git
+      - curl
+      - wget
+      - ca-certificates
+      - gnupg
+      - lsb-release
+    state: latest
+    install_recommends: no
+
+- name: Ensure Oh My Zsh installed
+  git:
+    repo: "{{ ohmyzsh_repo }}"
+    dest: "/home/{{ user }}/.oh-my-zsh"
+    version: master
+    update: yes
+  become_user: "{{ user }}"
+  when: not ansible_check_mode
+
+- name: Deploy .zshrc from template
+  template:
+    src: zshrc.j2
+    dest: "/home/{{ user }}/.zshrc"
+    owner: "{{ user }}"
+    group: "{{ user }}"
+    mode: '0644'
+
+- name: Set default shell to zsh
+  user:
+    name: "{{ user }}"
+    shell: /usr/bin/zsh
+
+- name: Ensure oh-my-zsh custom plugins directory exists
+  file:
+    path: "/home/{{ user }}/.oh-my-zsh/custom/plugins"
+    state: directory
+    owner: "{{ user }}"
+    group: "{{ user }}"
+    mode: '0755'
+
+# --- SSH key handling: try to deploy a private key from role files (encrypted externally),
+# otherwise generate one for the user. This supports a workflow where you keep a single
+# private key and distribute it via a secure channel (e.g. ansible-vault, secret manager)
+
+- name: Ensure .ssh directory exists
+  file:
+    path: "/home/{{ user }}/.ssh"
+    state: directory
+    owner: "{{ user }}"
+    group: "{{ user }}"
+    mode: '0700'
+
+- name: Deploy SSH private key from SSH_KEY_GITHUB environment variable (if set)
+  copy:
+    content: "{{ ansible_env.SSH_KEY_GITHUB }}"
+    dest: "/home/{{ user }}/.ssh/id_ed25519"
+    owner: "{{ user }}"
+    group: "{{ user }}"
+    mode: '0600'
+  when: ansible_env.SSH_KEY_GITHUB is defined and ansible_env.SSH_KEY_GITHUB != ''
+
+- name: Generate public key from deployed private key (if env provided)
+  become_user: "{{ user }}"
+  shell: ssh-keygen -y -f "$HOME/.ssh/id_ed25519" > "$HOME/.ssh/id_ed25519.pub"
+  args:
+    creates: "/home/{{ user }}/.ssh/id_ed25519.pub"
+  when: ansible_env.SSH_KEY_GITHUB is defined and ansible_env.SSH_KEY_GITHUB != ''
+
+- name: Ensure SSH config uses the key for github.com
+  copy:
+    dest: "/home/{{ user }}/.ssh/config"
+    owner: "{{ user }}"
+    group: "{{ user }}"
+    mode: '0644'
+    content: |
+      Host github.com
+        HostName github.com
+        User git
+        IdentityFile ~/.ssh/id_ed25519
+        IdentitiesOnly yes
+  when: ansible_env.SSH_KEY_GITHUB is defined and ansible_env.SSH_KEY_GITHUB != ''
+
+- name: Add key to ssh-agent (best-effort)
+  become_user: "{{ user }}"
+  shell: |
+    eval "$(ssh-agent -s)" >/dev/null || true
+    ssh-add "$HOME/.ssh/id_ed25519" || true
+  when: ansible_env.SSH_KEY_GITHUB is defined and ansible_env.SSH_KEY_GITHUB != ''
+
+- name: Configure Git to use SSH for commit signing (ssh-format)
+  become_user: "{{ user }}"
+  shell: |
+    pub=$(cat "$HOME/.ssh/id_ed25519.pub" 2>/dev/null || true)
+    if [ -n "$pub" ]; then
+      git config --global gpg.format ssh
+      git config --global gpg.ssh.program ssh-keygen
+      git config --global user.signingKey "key::$pub"
+    fi
+  when: ansible_env.SSH_KEY_GITHUB is defined and ansible_env.SSH_KEY_GITHUB != ''
+
+- name: Check for bundled private key file in repository
+  stat:
+    path: "{{ playbook_dir }}/roles/wsl-setup/files/id_ed25519"
+  register: bundled_key
+
+- name: Deploy private key from role files (if present)
+  copy:
+    src: "files/id_ed25519"
+    dest: "/home/{{ user }}/.ssh/id_ed25519"
+    owner: "{{ user }}"
+    group: "{{ user }}"
+    mode: '0600'
+  when: bundled_key.stat.exists
+
+- name: Deploy public key from role files (if present)
+  copy:
+    src: "files/id_ed25519.pub"
+    dest: "/home/{{ user }}/.ssh/id_ed25519.pub"
+    owner: "{{ user }}"
+    group: "{{ user }}"
+    mode: '0644'
+  when: bundled_key.stat.exists
+
+- name: Generate id_ed25519 keypair for user when not provided
+  become_user: "{{ user }}"
+  shell: |
+    mkdir -p "$HOME/.ssh"
+    if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
+      ssh-keygen -t ed25519 -C "{{ user }}@{{ ansible_fqdn | default(inventory_hostname) }}" -f "$HOME/.ssh/id_ed25519" -N ""
+    fi
+  args:
+    creates: "/home/{{ user }}/.ssh/id_ed25519"
+  when: not bundled_key.stat.exists
+
+- name: Ensure authorized_keys contains the public key
+  become_user: "{{ user }}"
+  authorized_key:
+    user: "{{ user }}"
+    state: present
+    key: "{{ lookup('file', playbook_dir + '/roles/wsl-setup/files/id_ed25519.pub') if bundled_key.stat.exists else lookup('file', '/home/' + user + '/.ssh/id_ed25519.pub') }}"
+
+# --- Install Astral 'uv' (standalone installer) if not present
+
+- name: Check for uv binary
+  stat:
+    path: "/home/{{ user }}/.local/bin/uv"
+  register: uv_bin
+
+- name: Install uv using the official standalone installer (curl)
+  become_user: "{{ user }}"
+  shell: curl -LsSf https://astral.sh/uv/install.sh | sh
+  args:
+    executable: /bin/bash
+  when: not uv_bin.stat.exists
+

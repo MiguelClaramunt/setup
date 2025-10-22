@@ -1,0 +1,10 @@
+---
+- name: Configure WSL developer environment
+  hosts: wsl
+  become: true
+  vars:
+    user: "{{ lookup('env','USER') }}"
+    zsh_theme: 'agnoster'
+    ohmyzsh_repo: 'https://github.com/ohmyzsh/ohmyzsh.git'
+  roles:
+    - wsl-setup
